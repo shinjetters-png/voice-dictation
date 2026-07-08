@@ -1,0 +1,13 @@
+{
+  "model": "mlx-community/whisper-large-v3-turbo",
+  "language": "ja",
+  "mode": "hold",
+  "hold_key": "ctrl_r",
+  "toggle_hotkey": "<ctrl>+<alt>+d",
+  "paste": true,
+  "play_sounds": true,
+  "samplerate": 16000,
+  "initial_prompt": "",
+  "debug": false,
+  "max_record_seconds": 300
+}

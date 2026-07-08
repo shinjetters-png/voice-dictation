@@ -1,0 +1,10 @@
+#!/bin/bash
+# Spawn Python as an independent process (not the bundle's main executable) so it
+# gets its own app identity and the menu-bar status item renders. Then exit, so
+# the bundle process does not keep the agent/bundle context around it.
+DIR="$HOME/voice-dictation"
+cd "$DIR" || exit 1
+export VD_ACCESSORY=1
+nohup "$DIR/.venv/bin/python" "$DIR/dictation_gui.py" >> "$DIR/app.log" 2>&1 &
+disown
+exit 0

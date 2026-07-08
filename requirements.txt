@@ -1,0 +1,7 @@
+mlx-whisper
+numpy
+sounddevice
+PySide6
+pyobjc-framework-Cocoa
+rumps
+pynput
