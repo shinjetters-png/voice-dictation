@@ -239,6 +239,10 @@ class Recorder:
         self.frames = queue.Queue()
         self.stream = None
         self.recording = False
+        # True while a stream teardown is stuck inside CoreAudio (seen with
+        # Bluetooth devices, e.g. soundcore multipoint). Cleared by the
+        # teardown thread if/when CoreAudio recovers.
+        self.wedged = False
 
     def _callback(self, indata, frames, time_info, status):
         if self.recording:
@@ -250,6 +254,13 @@ class Recorder:
         )
 
     def start(self):
+        # A wedged teardown means CoreAudio's HAL mutex is still held; opening
+        # or stopping another stream from here would block on that same mutex
+        # and freeze the GUI. Refuse until the teardown thread reports back.
+        if self.wedged:
+            raise RuntimeError(
+                "マイクの停止処理が終わっていません。ヘッドホンの電源を入れ直してからお試しください"
+            )
         while not self.frames.empty():
             self.frames.get_nowait()
         # Close any stray stream left behind by an aborted session so the mic
@@ -278,15 +289,28 @@ class Recorder:
         # raises we must not be left in a phantom "recording" state.
         self.recording = True
 
-    def stop(self):
+    def stop(self, timeout=5.0):
         self.recording = False
-        if self.stream is not None:
-            try:
-                self.stream.stop()
-                self.stream.close()
-            except Exception:
-                pass
-            self.stream = None
+        stream, self.stream = self.stream, None
+        if stream is not None:
+            # PortAudio's stop/close can deadlock forever inside CoreAudio
+            # (HALB_Mutex) when a Bluetooth input device wedges, so it runs on
+            # a sacrificial thread. On timeout the stream is abandoned — the
+            # captured frames below are still returned, so the dictation
+            # survives even when the device does not.
+            def _teardown():
+                try:
+                    stream.stop()
+                    stream.close()
+                except Exception:
+                    pass
+                finally:
+                    self.wedged = False
+
+            self.wedged = True
+            t = threading.Thread(target=_teardown, daemon=True)
+            t.start()
+            t.join(timeout)
         chunks = []
         while not self.frames.empty():
             chunks.append(self.frames.get_nowait())
@@ -860,12 +884,25 @@ class MainWindow(QWidget):
 
     def _stop_and_transcribe(self):
         self._watchdog.stop()
-        audio = self.recorder.stop()
-        log(f"recording stopped ({audio.size / self.config['samplerate']:.1f}s of audio)")
+        # Flip the flags here so the hotkey/watchdog handlers immediately see
+        # the recording as finished, but keep the actual stream teardown off
+        # the main thread — it can block inside CoreAudio (see Recorder.stop)
+        # and must never take the GUI down with it.
+        self.recorder.recording = False
         self.busy = True
         self.bridge.state.emit("working")
         self.bridge.status.emit("文字起こし中…")
-        threading.Thread(target=self._do_transcribe, args=(audio,), daemon=True).start()
+        threading.Thread(target=self._finish_and_transcribe, daemon=True).start()
+
+    def _finish_and_transcribe(self):
+        audio = self.recorder.stop()
+        log(f"recording stopped ({audio.size / self.config['samplerate']:.1f}s of audio)")
+        if self.recorder.wedged:
+            log("recorder: stream teardown timed out — audio kept, stream abandoned")
+            self.bridge.status.emit(
+                "マイクの停止に失敗しました（ヘッドホンの電源を入れ直すと復旧します）"
+            )
+        self._do_transcribe(audio)
 
     def _do_transcribe(self, audio):
         try:
