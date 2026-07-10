@@ -58,6 +58,9 @@ python3 -m venv .venv
 | `paste` | `true` で自動貼り付け。`false` ならクリップボードに入れるだけ |
 | `play_sounds` | 開始・完了の効果音 |
 | `initial_prompt` | 固有名詞など、認識を寄せたい語を入れておける（例：`"Claude, Obsidian"`） |
+| `transcribe_temperatures` | 認識失敗時の再試行温度。既定は `[0.0, 0.2]`（最大2回） |
+| `rewarm_enabled` | 長時間休止後、次の録音中にモデルを再ウォームアップする |
+| `rewarm_after_seconds` | 再ウォームアップを行う休止時間。既定は600秒（10分） |
 
 変更後はアプリを再起動してください（ホットキー系は再起動で反映）。
 

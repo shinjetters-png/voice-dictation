@@ -351,10 +351,19 @@ class MainWindow(QWidget):
     def __init__(self):
         super().__init__()
         self.config = load_config()
+        # New performance settings remain backward-compatible with older
+        # config.json files from the initial public release.
+        self.config.setdefault("transcribe_temperatures", [0.0, 0.2])
+        self.config.setdefault("rewarm_enabled", True)
+        self.config.setdefault("rewarm_after_seconds", 600)
         self.dict_words, self.dict_repls = load_dict()
         self.recorder = Recorder(self.config["samplerate"])
         self.busy = False
         self._transcribe = None
+        self._model_lock = threading.Lock()
+        self._last_model_use_at = 0.0
+        self._rewarm_thread = None
+        self._stop_requested_at = None
         self.bridge = Bridge()
         self._monitors = []
 
@@ -745,13 +754,55 @@ class MainWindow(QWidget):
         self._transcribe = mlx_whisper.transcribe
         log("warm-up: running dummy transcription")
         try:
-            self._transcribe(np.zeros(16000, dtype=np.float32), path_or_hf_repo=self.config["model"])
+            started = time.perf_counter()
+            with self._model_lock:
+                self._transcribe(
+                    np.zeros(16000, dtype=np.float32),
+                    path_or_hf_repo=self.config["model"],
+                    language=self.config.get("language") or None,
+                    temperature=0.0,
+                )
+                self._last_model_use_at = time.monotonic()
+            log(f"timing: initial_warmup={(time.perf_counter() - started) * 1000:.0f}ms")
         except Exception as e:
             log(f"warm-up failed: {e}")
             self.bridge.status.emit(f"モデル読込エラー: {e}")
             return
         log("warm-up: done")
         self.bridge.status.emit("待機中（ホットキーまたはボタンで開始）")
+
+    def _maybe_rewarm(self):
+        """Warm the model only after a long idle period, overlapping the work
+        with the user's speech. There is no periodic background activity."""
+        if not self.config.get("rewarm_enabled", True) or self._transcribe is None:
+            return
+        threshold = max(0, float(self.config.get("rewarm_after_seconds", 600)))
+        idle = time.monotonic() - self._last_model_use_at
+        if self._last_model_use_at <= 0 or idle < threshold:
+            return
+        if self._rewarm_thread is not None and self._rewarm_thread.is_alive():
+            return
+
+        def run():
+            started = time.perf_counter()
+            log(f"re-warm: starting after {idle:.0f}s idle")
+            try:
+                with self._model_lock:
+                    self._transcribe(
+                        np.zeros(16000, dtype=np.float32),
+                        path_or_hf_repo=self.config["model"],
+                        language=self.config.get("language") or None,
+                        temperature=0.0,
+                    )
+                    self._last_model_use_at = time.monotonic()
+                log(f"timing: rewarm={(time.perf_counter() - started) * 1000:.0f}ms")
+            except Exception as e:
+                # Re-warming is an optimization only. A failure must never
+                # prevent the real recording from being transcribed.
+                log(f"re-warm failed: {e}")
+
+        self._rewarm_thread = threading.Thread(target=run, daemon=True)
+        self._rewarm_thread.start()
 
     # ---- hotkey ---------------------------------------------------------
     def _remove_monitors(self):
@@ -858,6 +909,7 @@ class MainWindow(QWidget):
         log(f"recording started ({'hotkey' if via_hotkey else 'button'})")
         self.bridge.state.emit("recording")
         self.bridge.status.emit("録音中…")
+        self._maybe_rewarm()
         if self.config.get("play_sounds", True):
             play_sound("Tink")
 
@@ -884,6 +936,7 @@ class MainWindow(QWidget):
 
     def _stop_and_transcribe(self):
         self._watchdog.stop()
+        self._stop_requested_at = time.perf_counter()
         # Flip the flags here so the hotkey/watchdog handlers immediately see
         # the recording as finished, but keep the actual stream teardown off
         # the main thread — it can block inside CoreAudio (see Recorder.stop)
@@ -895,8 +948,11 @@ class MainWindow(QWidget):
         threading.Thread(target=self._finish_and_transcribe, daemon=True).start()
 
     def _finish_and_transcribe(self):
+        stop_started = time.perf_counter()
         audio = self.recorder.stop()
+        stop_ms = (time.perf_counter() - stop_started) * 1000
         log(f"recording stopped ({audio.size / self.config['samplerate']:.1f}s of audio)")
+        log(f"timing: recorder_stop={stop_ms:.0f}ms")
         if self.recorder.wedged:
             log("recorder: stream teardown timed out — audio kept, stream abandoned")
             self.bridge.status.emit(
@@ -905,6 +961,12 @@ class MainWindow(QWidget):
         self._do_transcribe(audio)
 
     def _do_transcribe(self, audio):
+        total_started = time.perf_counter()
+        inference_ms = 0.0
+        lock_wait_ms = 0.0
+        postprocess_ms = 0.0
+        clipboard_ms = 0.0
+        paste_ms = 0.0
         try:
             # Below ~0.5s Whisper tends to hallucinate long text out of the
             # dictionary prompt and paste garbage — treat as an accidental tap.
@@ -925,8 +987,21 @@ class MainWindow(QWidget):
             prompt = self._build_prompt()
             if prompt:
                 kwargs["initial_prompt"] = prompt
+            temperatures = self.config.get("transcribe_temperatures", [0.0, 0.2])
+            if isinstance(temperatures, (int, float)):
+                kwargs["temperature"] = float(temperatures)
+            else:
+                temperatures = tuple(float(t) for t in temperatures)
+                kwargs["temperature"] = temperatures or (0.0, 0.2)
 
-            result = self._transcribe(audio, **kwargs)
+            lock_started = time.perf_counter()
+            with self._model_lock:
+                lock_wait_ms = (time.perf_counter() - lock_started) * 1000
+                inference_started = time.perf_counter()
+                result = self._transcribe(audio, **kwargs)
+                inference_ms = (time.perf_counter() - inference_started) * 1000
+                self._last_model_use_at = time.monotonic()
+            postprocess_started = time.perf_counter()
             # Hallucination filter (standard Whisper heuristic): drop segments
             # that are probably not speech, otherwise dead air + the dictionary
             # prompt turns into hundreds of characters of pasted garbage.
@@ -942,18 +1017,25 @@ class MainWindow(QWidget):
                 if len(kept) < len(segments):
                     log(f"hallucination filter: dropped {len(segments) - len(kept)}/{len(segments)} segments")
                 text = "".join(s.get("text", "") for s in kept).strip()
+                used_temperatures = sorted({float(s.get("temperature") or 0.0) for s in segments})
+                log(f"decode: temperatures={used_temperatures}")
             else:
                 text = (result.get("text") or "").strip()
             if not text:
                 self.bridge.status.emit("（無音でした）")
                 return
             text = self._apply_replacements(text)
+            postprocess_ms = (time.perf_counter() - postprocess_started) * 1000
 
             self.bridge.transcript.emit(text)
+            clipboard_started = time.perf_counter()
             set_clipboard(text)
+            clipboard_ms = (time.perf_counter() - clipboard_started) * 1000
             if self.config.get("paste", True):
+                paste_started = time.perf_counter()
                 time.sleep(0.15)
                 paste_at_cursor()
+                paste_ms = (time.perf_counter() - paste_started) * 1000
             if self.config.get("play_sounds", True):
                 play_sound("Pop")
             self.bridge.status.emit("✓ 完了（クリップボードにも入っています）")
@@ -962,6 +1044,21 @@ class MainWindow(QWidget):
             log(f"transcribe error: {e}")
             self.bridge.status.emit(f"エラー: {e}")
         finally:
+            total_ms = (time.perf_counter() - total_started) * 1000
+            since_stop_ms = (
+                (time.perf_counter() - self._stop_requested_at) * 1000
+                if self._stop_requested_at is not None else total_ms
+            )
+            log(
+                "timing: "
+                f"model_lock_wait={lock_wait_ms:.0f}ms, "
+                f"inference={inference_ms:.0f}ms, "
+                f"postprocess={postprocess_ms:.0f}ms, "
+                f"clipboard={clipboard_ms:.0f}ms, "
+                f"paste={paste_ms:.0f}ms, "
+                f"transcribe_total={total_ms:.0f}ms, "
+                f"stop_to_done={since_stop_ms:.0f}ms"
+            )
             self.busy = False
             self.bridge.state.emit("idle")
 

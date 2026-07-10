@@ -9,5 +9,11 @@
   "samplerate": 16000,
   "initial_prompt": "",
   "debug": false,
-  "max_record_seconds": 300
+  "max_record_seconds": 300,
+  "transcribe_temperatures": [
+    0.0,
+    0.2
+  ],
+  "rewarm_enabled": true,
+  "rewarm_after_seconds": 600
 }
