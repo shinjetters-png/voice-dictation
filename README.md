@@ -56,6 +56,7 @@ python3 -m venv .venv
 | `mode` | `"hold"`（押している間録音）/ `"toggle"`（キーで開始・停止） |
 | `hold_key` | holdモードのキー。`alt_r`（右⌥）/ `cmd_r`（右⌘）/ `ctrl_r` / `shift_r` |
 | `toggle_hotkey` | toggleモードの組合せ。例 `"<ctrl>+<alt>+d"` |
+| `input_device` | 使うマイクのデバイス名（設定タブの「マイク」でも選択可）。`""`（空）ならシステムデフォルト。固定しておくと、Bluetoothヘッドホンの接続で既定入力が替わっても影響を受けません。見つからないときはシステムデフォルトに退避します |
 | `paste` | `true` で自動貼り付け。`false` ならクリップボードに入れるだけ |
 | `play_sounds` | 開始・完了の効果音 |
 | `initial_prompt` | 固有名詞など、認識を寄せたい語を入れておける（例：`"Claude, Obsidian"`） |

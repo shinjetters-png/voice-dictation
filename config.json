@@ -14,5 +14,6 @@
     0.0
   ],
   "rewarm_enabled": true,
-  "rewarm_after_seconds": 600
+  "rewarm_after_seconds": 600,
+  "input_device": "MacBook Proのマイク"
 }

@@ -242,9 +242,25 @@ def make_dot_icon(color):
     return QIcon(pm)
 
 
+def list_input_devices(refresh=False):
+    """Names of the current input-capable devices. refresh=True re-enumerates
+    first — only safe while no stream is open."""
+    if refresh:
+        try:
+            sd._terminate()
+            sd._initialize()
+        except Exception:
+            pass
+    return [d["name"] for d in sd.query_devices() if d["max_input_channels"] > 0]
+
+
 class Recorder:
-    def __init__(self, samplerate):
+    def __init__(self, samplerate, input_device=""):
         self.samplerate = samplerate
+        # Device *name* to record from ("" = system default). Pinning by name
+        # keeps dictation on the real mic even when macOS hands the default
+        # input to a Bluetooth headset (e.g. soundcore HFP) that connects.
+        self.input_device = input_device
         self.frames = queue.Queue()
         self.stream = None
         self.recording = False
@@ -257,9 +273,20 @@ class Recorder:
         if self.recording:
             self.frames.put(indata.copy())
 
+    def _resolve_device(self):
+        """PortAudio index of the pinned device, or None for system default."""
+        if not self.input_device:
+            return None
+        for i, d in enumerate(sd.query_devices()):
+            if d["max_input_channels"] > 0 and d["name"] == self.input_device:
+                return i
+        log(f"input device '{self.input_device}' not found — using system default")
+        return None
+
     def _open_stream(self):
         return sd.InputStream(
-            samplerate=self.samplerate, channels=1, dtype="float32", callback=self._callback
+            samplerate=self.samplerate, channels=1, dtype="float32",
+            device=self._resolve_device(), callback=self._callback
         )
 
     def start(self):
@@ -281,19 +308,32 @@ class Recorder:
             except Exception:
                 pass
             self.stream = None
+        # PortAudio enumerates devices once at init; after the device set
+        # changes (Bluetooth connect/disconnect, default-input switch) the
+        # cached indices are stale — opening then either fails with '!obj' or,
+        # worse, silently attaches to a dead device and records 0 frames while
+        # holding the mic open. Re-enumerating costs ~2ms, so do it every time.
+        # Safe here: no stream is open at this point.
+        try:
+            sd._terminate()
+            sd._initialize()
+        except Exception:
+            pass
         # Open a fresh stream each time so the mic is released between recordings
         # (otherwise macOS keeps showing the orange "mic in use" indicator).
         try:
             self.stream = self._open_stream()
         except sd.PortAudioError:
-            # PortAudio enumerates devices once at init; if the default input
-            # changed since launch (e.g. Bluetooth headphones connected), the
-            # cached device id is stale and open fails with '!obj'. Re-init to
-            # re-enumerate, then retry once.
+            # A device can still vanish between the re-enumeration above and
+            # the open (e.g. Bluetooth dropping out) — re-init and retry once.
             sd._terminate()
             sd._initialize()
             self.stream = self._open_stream()
         self.stream.start()
+        try:
+            log(f"input: {sd.query_devices(self.stream.device)['name']}")
+        except Exception:
+            pass
         # Only flag as recording once the stream is actually live — if start()
         # raises we must not be left in a phantom "recording" state.
         self.recording = True
@@ -365,8 +405,9 @@ class MainWindow(QWidget):
         self.config.setdefault("transcribe_temperatures", [0.0])
         self.config.setdefault("rewarm_enabled", True)
         self.config.setdefault("rewarm_after_seconds", 600)
+        self.config.setdefault("input_device", "")
         self.dict_words, self.dict_repls = load_dict()
-        self.recorder = Recorder(self.config["samplerate"])
+        self.recorder = Recorder(self.config["samplerate"], self.config["input_device"])
         self.busy = False
         self._transcribe = None
         self._qwen_model = None
@@ -626,6 +667,10 @@ class MainWindow(QWidget):
         if self.config.get("hold_key", "ctrl_r") in HOLD_KEYS:
             self.holdkey_cb.setCurrentText(self.config["hold_key"])
         form.addRow("holdキー", self.holdkey_cb)
+
+        self.device_cb = QComboBox()
+        self._populate_device_cb()
+        form.addRow("マイク", self.device_cb)
 
         self.toggle_edit = QLineEdit(self.config.get("toggle_hotkey", "<ctrl>+<alt>+d"))
         form.addRow("toggleキー", self.toggle_edit)
@@ -1147,6 +1192,28 @@ class MainWindow(QWidget):
             self.bridge.state.emit("idle")
 
     # ---- settings -------------------------------------------------------
+    DEVICE_DEFAULT_LABEL = "システムデフォルト"
+
+    def _populate_device_cb(self):
+        # Re-enumerating tears PortAudio down, which must never happen while a
+        # stream is open — fall back to the cached list during a recording.
+        refresh = not (self.recorder.recording or self.busy)
+        names = list_input_devices(refresh=refresh)
+        pinned = self.config.get("input_device", "")
+        if pinned and pinned not in names:
+            names.append(pinned)  # keep an unplugged pinned mic selectable
+        self.device_cb.clear()
+        self.device_cb.addItem(self.DEVICE_DEFAULT_LABEL)
+        self.device_cb.addItems(names)
+        self.device_cb.setCurrentText(pinned if pinned else self.DEVICE_DEFAULT_LABEL)
+
+    def showEvent(self, event):
+        # The device list is refreshed on every open so a newly plugged-in mic
+        # shows up without restarting the app.
+        if hasattr(self, "device_cb"):
+            self._populate_device_cb()
+        super().showEvent(event)
+
     def _save_settings(self):
         self.config["model"] = self.model_cb.currentText()
         self.config["language"] = ["ja", "en", ""][self.lang_cb.currentIndex()]
@@ -1155,6 +1222,8 @@ class MainWindow(QWidget):
         self.config["toggle_hotkey"] = self.toggle_edit.text().strip()
         self.config["paste"] = self.paste_chk.isChecked()
         self.config["play_sounds"] = self.sound_chk.isChecked()
+        device = self.device_cb.currentText()
+        self.config["input_device"] = "" if device == self.DEVICE_DEFAULT_LABEL else device
         save_config(self.config)
         # Shut down any in-flight recording before swapping the recorder —
         # replacing it while a stream is open would leak the mic (orange dot
@@ -1163,7 +1232,7 @@ class MainWindow(QWidget):
         if self.recorder.recording:
             self.recorder.stop()
             self.bridge.state.emit("idle")
-        self.recorder = Recorder(self.config["samplerate"])
+        self.recorder = Recorder(self.config["samplerate"], self.config["input_device"])
         self._restart_listener()
         self.bridge.status.emit("設定を保存しました。モデル変更時は次回録音で読み込みます")
         threading.Thread(target=self._warm_up, daemon=True).start()
