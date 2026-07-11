@@ -7,12 +7,18 @@ paste at the cursor. Has a modern sidebar UI with a custom-word dictionary that
 biases recognition toward your own vocabulary.
 """
 
+import faulthandler
 import json
 import os
 import queue
 import subprocess
 import threading
 import time
+
+# Native crashes (PortAudio/CoreAudio/Qt) otherwise kill the process without
+# leaving a line in app.log — dump the traceback to stderr, which the .app
+# launcher redirects into app.log.
+faulthandler.enable()
 
 import numpy as np
 import sounddevice as sd
@@ -242,15 +248,12 @@ def make_dot_icon(color):
     return QIcon(pm)
 
 
-def list_input_devices(refresh=False):
-    """Names of the current input-capable devices. refresh=True re-enumerates
-    first — only safe while no stream is open."""
-    if refresh:
-        try:
-            sd._terminate()
-            sd._initialize()
-        except Exception:
-            pass
+def list_input_devices():
+    """Names of the input-capable devices from PortAudio's current table.
+    Deliberately no re-enumeration here: tearing PortAudio down from GUI
+    code paths is not provably safe, and Recorder.start() already refreshes
+    the table on every recording, so the cache is never older than the last
+    take."""
     return [d["name"] for d in sd.query_devices() if d["max_input_channels"] > 0]
 
 
@@ -1195,10 +1198,7 @@ class MainWindow(QWidget):
     DEVICE_DEFAULT_LABEL = "システムデフォルト"
 
     def _populate_device_cb(self):
-        # Re-enumerating tears PortAudio down, which must never happen while a
-        # stream is open — fall back to the cached list during a recording.
-        refresh = not (self.recorder.recording or self.busy)
-        names = list_input_devices(refresh=refresh)
+        names = list_input_devices()
         pinned = self.config.get("input_device", "")
         if pinned and pinned not in names:
             names.append(pinned)  # keep an unplugged pinned mic selectable
