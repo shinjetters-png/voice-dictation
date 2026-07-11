@@ -11,8 +11,7 @@
   "debug": false,
   "max_record_seconds": 300,
   "transcribe_temperatures": [
-    0.0,
-    0.2
+    0.0
   ],
   "rewarm_enabled": true,
   "rewarm_after_seconds": 600

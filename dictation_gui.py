@@ -362,7 +362,7 @@ class MainWindow(QWidget):
         self.config = load_config()
         # New performance settings remain backward-compatible with older
         # config.json files from the initial public release.
-        self.config.setdefault("transcribe_temperatures", [0.0, 0.2])
+        self.config.setdefault("transcribe_temperatures", [0.0])
         self.config.setdefault("rewarm_enabled", True)
         self.config.setdefault("rewarm_after_seconds", 600)
         self.dict_words, self.dict_repls = load_dict()
@@ -1012,6 +1012,11 @@ class MainWindow(QWidget):
         clipboard_ms = 0.0
         paste_ms = 0.0
         try:
+            duration_s = audio.size / self.config["samplerate"]
+            # Peak is logged on every take so a degraded mic (e.g. soundcore
+            # multipoint after a call) can be spotted in the log after the fact.
+            peak = float(np.abs(audio).max())
+            log(f"audio: {duration_s:.1f}s, peak={peak:.4f}")
             # Below ~0.5s Whisper tends to hallucinate long text out of the
             # dictionary prompt and paste garbage — treat as an accidental tap.
             if audio.size < self.config["samplerate"] * 0.5:
@@ -1019,7 +1024,6 @@ class MainWindow(QWidget):
                 return
             # Silence gate: Whisper + initial_prompt hallucinates hundreds of
             # characters out of dead air, which would get pasted as garbage.
-            peak = float(np.abs(audio).max())
             if peak < 0.015:
                 log(f"silence gate: peak={peak:.4f} — skipping transcription")
                 self.bridge.status.emit("（無音でした）")
@@ -1028,11 +1032,11 @@ class MainWindow(QWidget):
             backend = model_backend(model_id)
             lang = self.config.get("language") or None
             prompt = self._build_prompt()
-            temperatures = self.config.get("transcribe_temperatures", [0.0, 0.2])
+            temperatures = self.config.get("transcribe_temperatures", [0.0])
             if isinstance(temperatures, (int, float)):
                 temperatures = (float(temperatures),)
             else:
-                temperatures = tuple(float(t) for t in temperatures) or (0.0, 0.2)
+                temperatures = tuple(float(t) for t in temperatures) or (0.0,)
 
             if backend == "qwen":
                 lock_started = time.perf_counter()
@@ -1093,6 +1097,16 @@ class MainWindow(QWidget):
                     text = (result.get("text") or "").strip()
             if not text:
                 self.bridge.status.emit("（無音でした）")
+                return
+            # Density gate: real Japanese speech stays well under 15 chars/s.
+            # Denser output means the model invented text from unintelligible
+            # audio (1.5s takes have produced 335 chars of prompt-seeded junk).
+            if len(text) > max(20.0, duration_s * 15):
+                log(
+                    f"density gate: {len(text)} chars from {duration_s:.1f}s audio "
+                    "— dropping as hallucination"
+                )
+                self.bridge.status.emit("聞き取れませんでした（もう一度お話しください）")
                 return
             text = self._apply_replacements(text)
             postprocess_ms = (time.perf_counter() - postprocess_started) * 1000

@@ -1,7 +1,8 @@
 # voice-dictation — superwhisper風ローカル音声入力（GUIアプリ）
 
 macOS（Apple Silicon）用の、ホットキーで喋ると文字起こしして今のカーソル位置へ貼り付けるアプリです。
-文字起こしは `mlx-whisper` で**完全ローカル・オフライン**。音声は外部に一切送りません。
+文字起こしは `mlx-whisper` / `mlx-audio` で**完全ローカル・オフライン**。音声は外部に一切送りません。
+モデルはWhisper系（large-v3-turbo等）のほか、日本語特化の kotoba-whisper v2.0 と Qwen3-ASR（0.6B / 1.7B）を設定画面から選べます。
 
 <p align="center"><img src="docs/home.png" width="640" alt="ホーム画面"></p>
 
@@ -50,7 +51,7 @@ python3 -m venv .venv
 
 | キー | 意味 |
 |------|------|
-| `model` | Whisperモデル。既定 `mlx-community/whisper-large-v3-turbo`。軽くしたいなら `mlx-community/whisper-small` |
+| `model` | 文字起こしモデル。既定 `mlx-community/whisper-large-v3-turbo`。日本語特化なら `kaiinui/kotoba-whisper-v2.0-mlx`、新世代の `mlx-community/Qwen3-ASR-1.7B-8bit` / `0.6B-8bit` も選択可。軽くしたいなら `mlx-community/whisper-small` |
 | `language` | `"ja"` 固定。自動判定は `""`（空）に |
 | `mode` | `"hold"`（押している間録音）/ `"toggle"`（キーで開始・停止） |
 | `hold_key` | holdモードのキー。`alt_r`（右⌥）/ `cmd_r`（右⌘）/ `ctrl_r` / `shift_r` |
@@ -58,7 +59,7 @@ python3 -m venv .venv
 | `paste` | `true` で自動貼り付け。`false` ならクリップボードに入れるだけ |
 | `play_sounds` | 開始・完了の効果音 |
 | `initial_prompt` | 固有名詞など、認識を寄せたい語を入れておける（例：`"Claude, Obsidian"`） |
-| `transcribe_temperatures` | 認識失敗時の再試行温度。既定は `[0.0, 0.2]`（最大2回） |
+| `transcribe_temperatures` | デコード温度。既定は `[0.0]`。再試行温度を足すと聞き取れない音声で幻覚が出やすいため非推奨 |
 | `rewarm_enabled` | 長時間休止後、次の録音中にモデルを再ウォームアップする |
 | `rewarm_after_seconds` | 再ウォームアップを行う休止時間。既定は600秒（10分） |
 
@@ -68,7 +69,7 @@ python3 -m venv .venv
 
 <p align="center"><img src="docs/dictionary.png" width="640" alt="辞書タブ"></p>
 
-- **単語** … Whisperへのヒントとして渡し、固有名詞や専門用語の認識を寄せます。
+- **単語** … モデルへのヒントとして渡し、固有名詞や専門用語の認識を寄せます（Whisper系は initial_prompt、Qwen3-ASR は文脈バイアスとして渡すので特に効果的です）。
 - **置換ルール** … 文字起こし後のテキストに必ず適用され、毎回出る誤変換をその場で直します（例：`クロード → Claude`）。ヒントで当たる確率を上げ、外れたら置換で拾う二段構えです。
 
 どちらも `dictionary.json` に保存されます（ローカル専用・コミット対象外）。
