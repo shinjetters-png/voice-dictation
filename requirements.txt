@@ -1,4 +1,5 @@
 mlx-whisper
+mlx-audio
 numpy
 sounddevice
 PySide6

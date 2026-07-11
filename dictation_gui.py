@@ -55,10 +55,19 @@ DICT_PATH = os.path.join(HERE, "dictionary.json")
 MODELS = [
     "mlx-community/whisper-large-v3-turbo",
     "mlx-community/whisper-large-v3",
+    "kaiinui/kotoba-whisper-v2.0-mlx",
+    "mlx-community/Qwen3-ASR-1.7B-8bit",
+    "mlx-community/Qwen3-ASR-0.6B-8bit",
     "mlx-community/whisper-medium",
     "mlx-community/whisper-small",
     "mlx-community/whisper-tiny",
 ]
+
+
+def model_backend(model_id):
+    """Qwen3-ASR runs on mlx-audio; everything else is a Whisper-family
+    model that mlx-whisper can load directly."""
+    return "qwen" if "qwen3-asr" in model_id.lower() else "whisper"
 HOLD_KEYS = ["cmd_r", "alt_r", "ctrl_r", "shift_r", "cmd_l", "alt_l", "ctrl_l", "shift_l"]
 
 # Device-independent modifier flag for each hold-key family — used by the
@@ -360,6 +369,9 @@ class MainWindow(QWidget):
         self.recorder = Recorder(self.config["samplerate"])
         self.busy = False
         self._transcribe = None
+        self._qwen_model = None
+        self._qwen_model_id = None
+        self._model_ready = False
         self._model_lock = threading.Lock()
         self._last_model_use_at = 0.0
         self._rewarm_thread = None
@@ -748,21 +760,45 @@ class MainWindow(QWidget):
     # ---- model ----------------------------------------------------------
     def _warm_up(self):
         self.bridge.status.emit("モデル読み込み中…（初回はダウンロードします）")
-        log("warm-up: importing mlx_whisper")
-        import mlx_whisper
-
-        self._transcribe = mlx_whisper.transcribe
-        log("warm-up: running dummy transcription")
+        model_id = self.config["model"]
         try:
             started = time.perf_counter()
-            with self._model_lock:
-                self._transcribe(
-                    np.zeros(16000, dtype=np.float32),
-                    path_or_hf_repo=self.config["model"],
-                    language=self.config.get("language") or None,
-                    temperature=0.0,
-                )
-                self._last_model_use_at = time.monotonic()
+            if model_backend(model_id) == "qwen":
+                log("warm-up: importing mlx_audio")
+                from mlx_audio.stt.utils import load_model
+
+                with self._model_lock:
+                    if self._qwen_model_id != model_id:
+                        self._qwen_model = None  # free the old one first
+                        self._qwen_model_id = None
+                        self._qwen_model = load_model(model_id)
+                        self._qwen_model_id = model_id
+                    self._model_ready = True
+                    log("warm-up: running dummy transcription")
+                    self._qwen_model.generate(
+                        np.zeros(16000, dtype=np.float32),
+                        language=self.config.get("language") or None,
+                    )
+                    self._last_model_use_at = time.monotonic()
+            else:
+                log("warm-up: importing mlx_whisper")
+                import mlx_whisper
+
+                self._transcribe = mlx_whisper.transcribe
+                self._model_ready = True
+                log("warm-up: running dummy transcription")
+                with self._model_lock:
+                    # A previously selected Qwen model is no longer needed —
+                    # drop it so its weights don't sit in memory.
+                    self._qwen_model = None
+                    self._qwen_model_id = None
+                    self._transcribe(
+                        np.zeros(16000, dtype=np.float32),
+                        path_or_hf_repo=model_id,
+                        language=self.config.get("language") or None,
+                        temperature=0.0,
+                    )
+                    self._last_model_use_at = time.monotonic()
             log(f"timing: initial_warmup={(time.perf_counter() - started) * 1000:.0f}ms")
         except Exception as e:
             log(f"warm-up failed: {e}")
@@ -774,7 +810,7 @@ class MainWindow(QWidget):
     def _maybe_rewarm(self):
         """Warm the model only after a long idle period, overlapping the work
         with the user's speech. There is no periodic background activity."""
-        if not self.config.get("rewarm_enabled", True) or self._transcribe is None:
+        if not self.config.get("rewarm_enabled", True) or not self._model_ready:
             return
         threshold = max(0, float(self.config.get("rewarm_after_seconds", 600)))
         idle = time.monotonic() - self._last_model_use_at
@@ -788,12 +824,20 @@ class MainWindow(QWidget):
             log(f"re-warm: starting after {idle:.0f}s idle")
             try:
                 with self._model_lock:
-                    self._transcribe(
-                        np.zeros(16000, dtype=np.float32),
-                        path_or_hf_repo=self.config["model"],
-                        language=self.config.get("language") or None,
-                        temperature=0.0,
-                    )
+                    if model_backend(self.config["model"]) == "qwen":
+                        if self._qwen_model is None:
+                            return
+                        self._qwen_model.generate(
+                            np.zeros(16000, dtype=np.float32),
+                            language=self.config.get("language") or None,
+                        )
+                    else:
+                        self._transcribe(
+                            np.zeros(16000, dtype=np.float32),
+                            path_or_hf_repo=self.config["model"],
+                            language=self.config.get("language") or None,
+                            temperature=0.0,
+                        )
                     self._last_model_use_at = time.monotonic()
                 log(f"timing: rewarm={(time.perf_counter() - started) * 1000:.0f}ms")
             except Exception as e:
@@ -884,7 +928,7 @@ class MainWindow(QWidget):
         self._start_recording(via_hotkey=True)
 
     def _start_recording(self, via_hotkey=False):
-        if self._transcribe is None:
+        if not self._model_ready:
             self.bridge.status.emit("モデル準備中… 少しお待ちください")
             return
         try:
@@ -980,47 +1024,73 @@ class MainWindow(QWidget):
                 log(f"silence gate: peak={peak:.4f} — skipping transcription")
                 self.bridge.status.emit("（無音でした）")
                 return
-            kwargs = {"path_or_hf_repo": self.config["model"]}
+            model_id = self.config["model"]
+            backend = model_backend(model_id)
             lang = self.config.get("language") or None
-            if lang:
-                kwargs["language"] = lang
             prompt = self._build_prompt()
-            if prompt:
-                kwargs["initial_prompt"] = prompt
             temperatures = self.config.get("transcribe_temperatures", [0.0, 0.2])
             if isinstance(temperatures, (int, float)):
-                kwargs["temperature"] = float(temperatures)
+                temperatures = (float(temperatures),)
             else:
-                temperatures = tuple(float(t) for t in temperatures)
-                kwargs["temperature"] = temperatures or (0.0, 0.2)
+                temperatures = tuple(float(t) for t in temperatures) or (0.0, 0.2)
 
-            lock_started = time.perf_counter()
-            with self._model_lock:
-                lock_wait_ms = (time.perf_counter() - lock_started) * 1000
-                inference_started = time.perf_counter()
-                result = self._transcribe(audio, **kwargs)
-                inference_ms = (time.perf_counter() - inference_started) * 1000
-                self._last_model_use_at = time.monotonic()
-            postprocess_started = time.perf_counter()
-            # Hallucination filter (standard Whisper heuristic): drop segments
-            # that are probably not speech, otherwise dead air + the dictionary
-            # prompt turns into hundreds of characters of pasted garbage.
-            segments = result.get("segments") or []
-            if segments:
-                kept = [
-                    s for s in segments
-                    if not (
-                        s.get("no_speech_prob", 0.0) > 0.6
-                        and s.get("avg_logprob", 0.0) < -1.0
+            if backend == "qwen":
+                lock_started = time.perf_counter()
+                with self._model_lock:
+                    lock_wait_ms = (time.perf_counter() - lock_started) * 1000
+                    if self._qwen_model is None or self._qwen_model_id != model_id:
+                        raise RuntimeError("モデルを読み込み中です。少し待ってからもう一度お試しください")
+                    inference_started = time.perf_counter()
+                    # The dictionary goes in as Qwen3-ASR context biasing —
+                    # unlike Whisper's initial_prompt it cannot leak into the
+                    # output, it only steers how words are spelled. The
+                    # 専門用語 label matters: without it the bias misses terms
+                    # the raw word list alone would catch.
+                    result = self._qwen_model.generate(
+                        audio,
+                        language=lang,
+                        temperature=temperatures[0],
+                        system_prompt=f"専門用語: {prompt}" if prompt else None,
                     )
-                ]
-                if len(kept) < len(segments):
-                    log(f"hallucination filter: dropped {len(segments) - len(kept)}/{len(segments)} segments")
-                text = "".join(s.get("text", "") for s in kept).strip()
-                used_temperatures = sorted({float(s.get("temperature") or 0.0) for s in segments})
-                log(f"decode: temperatures={used_temperatures}")
+                    inference_ms = (time.perf_counter() - inference_started) * 1000
+                    self._last_model_use_at = time.monotonic()
+                postprocess_started = time.perf_counter()
+                text = (result.text or "").strip()
             else:
-                text = (result.get("text") or "").strip()
+                kwargs = {"path_or_hf_repo": model_id}
+                if lang:
+                    kwargs["language"] = lang
+                if prompt:
+                    kwargs["initial_prompt"] = prompt
+                kwargs["temperature"] = temperatures if len(temperatures) > 1 else temperatures[0]
+
+                lock_started = time.perf_counter()
+                with self._model_lock:
+                    lock_wait_ms = (time.perf_counter() - lock_started) * 1000
+                    inference_started = time.perf_counter()
+                    result = self._transcribe(audio, **kwargs)
+                    inference_ms = (time.perf_counter() - inference_started) * 1000
+                    self._last_model_use_at = time.monotonic()
+                postprocess_started = time.perf_counter()
+                # Hallucination filter (standard Whisper heuristic): drop segments
+                # that are probably not speech, otherwise dead air + the dictionary
+                # prompt turns into hundreds of characters of pasted garbage.
+                segments = result.get("segments") or []
+                if segments:
+                    kept = [
+                        s for s in segments
+                        if not (
+                            s.get("no_speech_prob", 0.0) > 0.6
+                            and s.get("avg_logprob", 0.0) < -1.0
+                        )
+                    ]
+                    if len(kept) < len(segments):
+                        log(f"hallucination filter: dropped {len(segments) - len(kept)}/{len(segments)} segments")
+                    text = "".join(s.get("text", "") for s in kept).strip()
+                    used_temperatures = sorted({float(s.get("temperature") or 0.0) for s in segments})
+                    log(f"decode: temperatures={used_temperatures}")
+                else:
+                    text = (result.get("text") or "").strip()
             if not text:
                 self.bridge.status.emit("（無音でした）")
                 return
