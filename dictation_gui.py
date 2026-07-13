@@ -11,7 +11,9 @@ import faulthandler
 import json
 import os
 import queue
+import re
 import subprocess
+import sys
 import threading
 import time
 
@@ -257,6 +259,40 @@ def list_input_devices():
     return [d["name"] for d in sd.query_devices() if d["max_input_channels"] > 0]
 
 
+# A teardown stuck in CoreAudio's HAL mutex poisons audio for the whole
+# process: every later open blocks on that same mutex, so no amount of
+# re-initialising PortAudio from here can take it back. Past this many seconds
+# the stream is never coming back and only a fresh process will record again.
+WEDGE_UNRECOVERABLE_SECONDS = 12.0
+
+
+def relaunch_app():
+    """Start a detached replacement process, then leave without cleanup.
+
+    os._exit skips atexit and PortAudio's own teardown on purpose — those would
+    block on the very mutex we are running away from.
+    """
+    here = os.path.dirname(os.path.abspath(__file__))
+    log("recovery: CoreAudio is wedged — relaunching the app")
+    try:
+        logfile = open(os.path.join(here, "app.log"), "a")
+        subprocess.Popen(
+            [sys.executable, os.path.abspath(__file__)],
+            cwd=here,
+            stdout=logfile,
+            stderr=subprocess.STDOUT,
+            start_new_session=True,
+            env=os.environ.copy(),
+        )
+    except Exception as e:
+        log(f"recovery: relaunch failed: {e} — please start the app again by hand")
+        return False
+    # Leave promptly: while this process lives its hotkey listener is still
+    # attached, and two listeners would each fire on the same key press.
+    time.sleep(0.3)
+    os._exit(0)
+
+
 class Recorder:
     def __init__(self, samplerate, input_device=""):
         self.samplerate = samplerate
@@ -271,6 +307,7 @@ class Recorder:
         # Bluetooth devices, e.g. soundcore multipoint). Cleared by the
         # teardown thread if/when CoreAudio recovers.
         self.wedged = False
+        self.wedged_at = None
 
     def _callback(self, indata, frames, time_info, status):
         if self.recording:
@@ -357,18 +394,29 @@ class Recorder:
                 except Exception:
                     pass
                 finally:
+                    if self.wedged_at is not None:
+                        log("recorder: CoreAudio released the stream — recovered")
                     self.wedged = False
+                    self.wedged_at = None
 
             self.wedged = True
             t = threading.Thread(target=_teardown, daemon=True)
             t.start()
             t.join(timeout)
+            if self.wedged:
+                self.wedged_at = time.monotonic()
         chunks = []
         while not self.frames.empty():
             chunks.append(self.frames.get_nowait())
         if not chunks:
             return np.zeros(0, dtype=np.float32)
         return np.concatenate(chunks, axis=0).flatten()
+
+    def wedged_for(self):
+        """Seconds the teardown has been stuck, or 0 when healthy."""
+        if not self.wedged or self.wedged_at is None:
+            return 0.0
+        return time.monotonic() - self.wedged_at
 
 
 class Bridge(QObject):
@@ -378,6 +426,7 @@ class Bridge(QObject):
     hotkey_start = Signal()
     hotkey_stop = Signal()
     hotkey_toggle = Signal()
+    wedged = Signal()
 
 
 class MenuHandler(NSObject):
@@ -398,6 +447,18 @@ STATE_EMOJI = {"idle": "🎙", "recording": "🔴", "working": "🟡"}
 # releases them (a released status item flashes on screen then vanishes).
 _RETAIN = []
 
+# A decoder stuck in a repetition loop emits the same short unit dozens of
+# times ("従って従って従って..."). The take usually holds real speech before
+# the loop starts, so collapse the run instead of dropping the whole thing.
+_REPEAT_LOOP = re.compile(r"(.{1,12}?)\1{3,}")
+
+
+def collapse_repeat_loops(text):
+    collapsed, n = _REPEAT_LOOP.subn(r"\1\1", text)
+    if n:
+        log(f"repeat guard: collapsed {n} loop(s), {len(text)} -> {len(collapsed)} chars")
+    return collapsed
+
 
 class MainWindow(QWidget):
     def __init__(self):
@@ -405,7 +466,11 @@ class MainWindow(QWidget):
         self.config = load_config()
         # New performance settings remain backward-compatible with older
         # config.json files from the initial public release.
-        self.config.setdefault("transcribe_temperatures", [0.0])
+        # The full ladder, not a pinned 0.0: compression_ratio_threshold can
+        # only reject a repetition loop by retrying at a higher temperature,
+        # so a single-temperature config makes that guard a no-op.
+        self.config.setdefault("transcribe_temperatures", [0.0, 0.2, 0.4, 0.6, 0.8, 1.0])
+        self.config.setdefault("condition_on_previous_text", False)
         self.config.setdefault("rewarm_enabled", True)
         self.config.setdefault("rewarm_after_seconds", 600)
         self.config.setdefault("input_device", "")
@@ -435,6 +500,7 @@ class MainWindow(QWidget):
         self.bridge.hotkey_start.connect(self._start_recording_hotkey)
         self.bridge.hotkey_stop.connect(self._stop_and_transcribe)
         self.bridge.hotkey_toggle.connect(self._toggle)
+        self.bridge.wedged.connect(self._watch_wedge)
 
         # Watchdog: while recording, poll the real key state and enforce a max
         # duration, so a missed release event can never leave the mic stuck on.
@@ -979,6 +1045,16 @@ class MainWindow(QWidget):
         if not self._model_ready:
             self.bridge.status.emit("モデル準備中… 少しお待ちください")
             return
+        if self.recorder.wedged:
+            # Still inside the grace window: the teardown may yet return, and
+            # throwing the process away then would cost the user a restart for
+            # nothing.
+            if self.recorder.wedged_for() < WEDGE_UNRECOVERABLE_SECONDS:
+                self.bridge.status.emit("マイクの解放待ちです。数秒お待ちください")
+                return
+            self.bridge.status.emit("マイクが応答しません。再起動しています…")
+            self._recover_from_wedge()
+            return
         try:
             self.recorder.start()
         except Exception as e:
@@ -1040,17 +1116,57 @@ class MainWindow(QWidget):
         threading.Thread(target=self._finish_and_transcribe, daemon=True).start()
 
     def _finish_and_transcribe(self):
-        stop_started = time.perf_counter()
-        audio = self.recorder.stop()
-        stop_ms = (time.perf_counter() - stop_started) * 1000
-        log(f"recording stopped ({audio.size / self.config['samplerate']:.1f}s of audio)")
-        log(f"timing: recorder_stop={stop_ms:.0f}ms")
-        if self.recorder.wedged:
-            log("recorder: stream teardown timed out — audio kept, stream abandoned")
-            self.bridge.status.emit(
-                "マイクの停止に失敗しました（ヘッドホンの電源を入れ直すと復旧します）"
-            )
+        # busy is only cleared inside _do_transcribe, so anything that throws on
+        # the way there would strand the app in "文字起こし中…" and refuse every
+        # later hotkey press. Never let this thread die with busy still set.
+        try:
+            stop_started = time.perf_counter()
+            audio = self.recorder.stop()
+            stop_ms = (time.perf_counter() - stop_started) * 1000
+            log(f"recording stopped ({audio.size / self.config['samplerate']:.1f}s of audio)")
+            log(f"timing: recorder_stop={stop_ms:.0f}ms")
+            if self.recorder.wedged:
+                log("recorder: stream teardown timed out — audio kept, stream abandoned")
+                self.bridge.status.emit("マイクの停止に失敗しました（復旧を試みます）")
+                self.bridge.wedged.emit()
+        except Exception as e:
+            log(f"stop failed: {e!r}")
+            self.busy = False
+            self.bridge.state.emit("idle")
+            self.bridge.status.emit(f"録音の終了に失敗しました: {e}")
+            return
         self._do_transcribe(audio)
+
+    # ---- wedge recovery -------------------------------------------------
+    def _watch_wedge(self):
+        """Come back once the teardown has had its chance, and heal if it failed."""
+        remaining = WEDGE_UNRECOVERABLE_SECONDS - self.recorder.wedged_for()
+        QTimer.singleShot(int(max(remaining, 1.0) * 1000), self._recover_if_still_wedged)
+
+    def _recover_if_still_wedged(self):
+        if not self.recorder.wedged:
+            self.bridge.status.emit("マイクが復旧しました")
+            return
+        # A transcription still holds the audio we just captured; relaunching
+        # now would throw away the text before it reaches the clipboard.
+        if self.busy:
+            QTimer.singleShot(2000, self._recover_if_still_wedged)
+            return
+        self.bridge.status.emit("マイクが応答しません。再起動しています…")
+        self._recover_from_wedge()
+
+    def _recover_from_wedge(self):
+        if getattr(self, "_recovering", False):
+            return
+        self._recovering = True
+        # Let the status text paint before the process goes away.
+        QTimer.singleShot(400, self._do_relaunch)
+
+    def _do_relaunch(self):
+        # Only returns if the spawn failed; on success the process is gone.
+        relaunch_app()
+        self._recovering = False
+        self.bridge.status.emit("再起動できませんでした。アプリを起動しなおしてください")
 
     def _do_transcribe(self, audio):
         total_started = time.perf_counter()
@@ -1115,6 +1231,13 @@ class MainWindow(QWidget):
                 if prompt:
                     kwargs["initial_prompt"] = prompt
                 kwargs["temperature"] = temperatures if len(temperatures) > 1 else temperatures[0]
+                # Off by default: a 30s window's text is otherwise fed to the
+                # next window as its prompt, so once the decoder starts looping
+                # on a word the loop carries across windows instead of ending
+                # with the take. Long dictations are where this bites.
+                kwargs["condition_on_previous_text"] = bool(
+                    self.config.get("condition_on_previous_text", False)
+                )
 
                 lock_started = time.perf_counter()
                 with self._model_lock:
@@ -1146,6 +1269,7 @@ class MainWindow(QWidget):
             if not text:
                 self.bridge.status.emit("（無音でした）")
                 return
+            text = collapse_repeat_loops(text)
             # Density gate: real Japanese speech stays well under 15 chars/s.
             # Denser output means the model invented text from unintelligible
             # audio (1.5s takes have produced 335 chars of prompt-seeded junk).
